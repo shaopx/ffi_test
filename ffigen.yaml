@@ -1,0 +1,22 @@
+# ffigen.yaml
+name: SlirpBindings
+description: 自动生成的 libslirp 接口绑定
+output: 'lib/slirp_bindings.dart'
+
+compiler-opts:
+  - '-I/Users/shaopx/data/c_libraries/libslirp/build'
+  - '-I/Users/shaopx/data/c_libraries/libslirp/src'
+
+# 告诉 ffigen 去哪里读 C 语言头文件
+headers:
+  entry-points:
+    # 这里填你刚才克隆的 libslirp 源码中的头文件路径
+    # (注意：需要使用绝对路径，或者相对于 ffigen.yaml 的相对路径)
+    - '/Users/shaopx/data/c_libraries/libslirp/src/libslirp.h'
+    # 因为有几个结构体是在 version.h 里的，把它也加上
+    - '/Users/shaopx/data/c_libraries/libslirp/build/libslirp-version.h'
+
+# 我们只关心 slirp_ 开头的函数和结构体，过滤掉系统的冗余代码
+comments:
+  style: any
+  length: full

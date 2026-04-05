@@ -1,0 +1,10 @@
+name: ffi_test
+description: My first FFI test project.
+
+environment:
+  sdk: ^3.0.0
+dependencies:
+  ffi: ^2.2.0
+  path: ^1.9.1
+dev_dependencies:
+  ffigen: ^20.1.1

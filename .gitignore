@@ -1,0 +1,28 @@
+# Dart
+.dart_tool/
+.packages
+pubspec.lock
+*.g.dart
+*.freezed.dart
+*.dill
+*.snapshot
+
+# Build outputs / compiled binaries
+build/
+*.dylib
+*.so
+*.dll
+*.exe
+gnirehtet_server
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

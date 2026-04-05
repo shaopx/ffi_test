@@ -1,0 +1,141 @@
+// 文件路径: lib/src/network/tunnel_server.dart
+
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:async';
+
+/// 负责监听本地端口，接收来自 ADB Tunnel 的真实字节流
+class TunnelServer {
+  // Dart 原生的 Socket 服务器端
+  ServerSocket? _serverSocket;
+  
+  // 当前正在活跃的手机端连接
+  Socket? _activeClient;
+
+  // 业务层回调：当收到手机发来的数据时触发
+  final void Function(Uint8List data) onPacketReceived;
+  
+  // 业务层回调：当手机断开连接时触发 (用于通知外层重置路由或 UI)
+  final void Function() onClientDisconnected;
+
+  bool _isRunning = false;
+
+  TunnelServer({
+    required this.onPacketReceived,
+    required this.onClientDisconnected,
+  });
+
+  /// 启动本地服务器，开始监听
+  /// [port] 必须与 adb reverse 中配置的 localPort 保持一致
+  Future<void> start(int port) async {
+    if (_isRunning) {
+      print('[TunnelServer] 警告：服务器已在运行中，请勿重复启动。');
+      return;
+    }
+
+    try {
+      // 绑定到本地回环地址 (127.0.0.1)，这样最安全，防止局域网内其他电脑蹭网
+      _serverSocket = await ServerSocket.bind(InternetAddress.loopbackIPv4, port);
+      _isRunning = true;
+      print('[TunnelServer] 启动成功！正在监听本地端口: $port');
+
+      // 持续监听来自手机端 (通过 adb reverse 转发过来) 的连接请求
+      _serverSocket!.listen(
+        _handleNewClient,
+        onError: (error) {
+          print('[TunnelServer] ServerSocket 发生严重异常: $error');
+          stop();
+        },
+        cancelOnError: true,
+      );
+    } catch (e) {
+      _isRunning = false;
+      throw Exception('TunnelServer 启动失败，端口 $port 可能已被占用！错误: $e');
+    }
+  }
+
+  /// 处理新的客户端连接
+  void _handleNewClient(Socket client) {
+    print('[TunnelServer] ⚡ 收到新的设备连接请求！远程端口: ${client.remotePort}');
+
+    // 【生产级防御】踢掉旧连接，确保通道唯一性
+    if (_activeClient != null) {
+      print('[TunnelServer] 警告：检测到旧的存活连接，正在强制断开并替换为新连接...');
+      _activeClient!.destroy();
+      _activeClient = null;
+    }
+
+    _activeClient = client;
+
+    // 禁用 Nagle 算法，降低网络延迟。这对于游戏、视频流等实时网络包极其重要！
+    client.setOption(SocketOption.tcpNoDelay, true);
+
+    // 监听数据流
+    client.listen(
+      (Uint8List data) {
+        print('📦 [TunnelServer] 收到来自手机的字节流，大小: ${data.length} Bytes');
+        if (data.isNotEmpty) {
+           print('🔍 [诊断] 数据包首字节: 0x${data[0].toRadixString(16).toUpperCase()}');
+        }
+        // 收到来自手机的字节流，直接甩给外层的 SlirpWrapper
+        onPacketReceived(data);
+      },
+      onError: (error) {
+        print('[TunnelServer] ❌ 客户端 Socket 发生读写错误: $error');
+        _cleanupActiveClient();
+      },
+      onDone: () {
+        print('[TunnelServer] 🔌 客户端主动断开了连接 (正常结束)。');
+        _cleanupActiveClient();
+      },
+      cancelOnError: true,
+    );
+  }
+
+  /// 发送数据给手机端 (通常是由 libslirp 处理完外网数据后，调用的回传动作)
+  void sendToDevice(Uint8List data) {
+    if (_activeClient == null) {
+      // 🚨 黑洞现身！如果打印了这个，说明 Socket 引用丢失了！
+      print('❌ [TunnelServer] 致命拦截：没有活跃的手机连接(_activeClient 为空)，数据被抛弃！');
+      return;
+    }
+
+    try {
+      // 🚀 亲眼看着数据塞进 TCP 管道
+      print('🚀 [TunnelServer] 真正执行 Socket.add，向底层 TCP 写入 ${data.length} 字节...');
+      _activeClient!.add(data);
+      
+    } catch (e) {
+      print('❌ [TunnelServer] 向 Socket 写入时发生物理异常: $e');
+    }
+  }
+
+  /// 清理当前活跃的客户端并触发回调
+  void _cleanupActiveClient() {
+    if (_activeClient != null) {
+      try {
+        _activeClient!.destroy();
+      } catch (e) {
+        // 忽略销毁时的异常
+      }
+      _activeClient = null;
+      print('[TunnelServer] 🧹 已清理失效的设备连接。');
+      
+      // 通知外层大脑 (RouterEngine)，让它去清理底层的 C 语言内存
+      onClientDisconnected();
+    }
+  }
+
+  /// 彻底关闭服务器 (用于退出 App 时)
+  Future<void> stop() async {
+    print('[TunnelServer] 准备彻底关闭服务器...');
+    _cleanupActiveClient();
+    
+    if (_serverSocket != null) {
+      await _serverSocket!.close();
+      _serverSocket = null;
+    }
+    _isRunning = false;
+    print('[TunnelServer] 服务器已安全停止。');
+  }
+}
