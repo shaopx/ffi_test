@@ -6,12 +6,14 @@ import 'dart:io';
 // 注意：这里的 'ffi_test' 需要替换成你 pubspec.yaml 里定义的 name 字段的值
 import 'package:ffi_test/src/core/router_engine.dart';
 import 'package:ffi_test/src/utils/logger.dart';
+import 'package:ffi_test/src/utils/file_logger.dart';
 
 void main(List<String> args) async {
   // 1. 初始化生产级日志系统
   // 在开发阶段，我们可以设置为 debug 看底层内存和字节流
   // 在发布生产时，可以改为 info 或 warning
   Logger.currentLevel = LogLevel.info;
+  FileLogger.init();
 
   Logger.i('=======================================');
   Logger.i('   🚀 跨平台虚拟路由器 (Dart FFI 版)   ');
@@ -43,9 +45,10 @@ void main(List<String> args) async {
     
     // 调用引擎的安全清理流水线
     await engine.stop();
-    
+    FileLogger.close();
+
     Logger.i('再见！👋');
-    exit(0); // 确保进程彻底干净地结束
+    exit(0);
   });
 
   // 5. 点火启动！

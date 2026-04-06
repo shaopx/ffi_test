@@ -3,6 +3,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:async';
+import '../utils/file_logger.dart';
 
 /// 负责监听本地端口，接收来自 ADB Tunnel 的真实字节流
 class TunnelServer {
@@ -56,7 +57,7 @@ class TunnelServer {
 
   /// 处理新的客户端连接
   void _handleNewClient(Socket client) {
-    print('[TunnelServer] ⚡ 收到新的设备连接请求！远程端口: ${client.remotePort}');
+    FileLogger.log('[TunnelServer] ⚡ 收到新的设备连接请求！远程端口: ${client.remotePort}');
 
     // 【生产级防御】踢掉旧连接，确保通道唯一性
     if (_activeClient != null) {
@@ -73,10 +74,7 @@ class TunnelServer {
     // 监听数据流
     client.listen(
       (Uint8List data) {
-        print('📦 [TunnelServer] 收到来自手机的字节流，大小: ${data.length} Bytes');
-        if (data.isNotEmpty) {
-           print('🔍 [诊断] 数据包首字节: 0x${data[0].toRadixString(16).toUpperCase()}');
-        }
+        _debugAnalyzePacket(data);
         // 收到来自手机的字节流，直接甩给外层的 SlirpWrapper
         onPacketReceived(data);
       },
@@ -93,18 +91,32 @@ class TunnelServer {
   }
 
   /// 发送数据给手机端 (通常是由 libslirp 处理完外网数据后，调用的回传动作)
+  int _downstreamPacketCount = 0;
+
   void sendToDevice(Uint8List data) {
     if (_activeClient == null) {
-      // 🚨 黑洞现身！如果打印了这个，说明 Socket 引用丢失了！
       print('❌ [TunnelServer] 致命拦截：没有活跃的手机连接(_activeClient 为空)，数据被抛弃！');
       return;
     }
 
+    _downstreamPacketCount++;
+    final seq = _downstreamPacketCount;
+
     try {
-      // 🚀 亲眼看着数据塞进 TCP 管道
-      print('🚀 [TunnelServer] 真正执行 Socket.add，向底层 TCP 写入 ${data.length} 字节...');
+      // 调试：分析回传包内容
+      if (data.isNotEmpty) {
+        final ipVer = data[0] >> 4;
+        int declaredLen = data.length;
+        if (ipVer == 4 && data.length >= 20) {
+          declaredLen = (data[2] << 8) | data[3];
+        } else if (ipVer == 6 && data.length >= 40) {
+          declaredLen = ((data[4] << 8) | data[5]) + 40;
+        }
+        final hexHead = data.take(4).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+        FileLogger.log('🚀 [DOWN#$seq] 发回手机 ${data.length}字节, IPv$ipVer, IP头声明=$declaredLen, head=[$hexHead]');
+      }
+
       _activeClient!.add(data);
-      
     } catch (e) {
       print('❌ [TunnelServer] 向 Socket 写入时发生物理异常: $e');
     }
@@ -123,6 +135,51 @@ class TunnelServer {
       
       // 通知外层大脑 (RouterEngine)，让它去清理底层的 C 语言内存
       onClientDisconnected();
+    }
+  }
+
+  // ========================================================================
+  // 调试分析：深度检查每个 TCP 接收到的数据
+  // ========================================================================
+  int _upstreamPacketCount = 0;
+
+  void _debugAnalyzePacket(Uint8List data) {
+    _upstreamPacketCount++;
+    final seq = _upstreamPacketCount;
+
+    if (data.isEmpty) {
+      FileLogger.log('⚠️ [UP#$seq] 收到空数据！');
+      return;
+    }
+
+    // Hex dump 前 20 字节
+    final hexPreview = data.take(20).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+    FileLogger.log('📦 [UP#$seq] 收到 ${data.length} 字节, hex: $hexPreview');
+
+    final ipVersion = data[0] >> 4;
+    if (ipVersion == 4 && data.length >= 20) {
+      // IPv4: Total Length 在字节 2-3 (big-endian)
+      final totalLength = (data[2] << 8) | data[3];
+      final protocol = data[9]; // 6=TCP, 17=UDP, 1=ICMP
+      final srcIp = '${data[12]}.${data[13]}.${data[14]}.${data[15]}';
+      final dstIp = '${data[16]}.${data[17]}.${data[18]}.${data[19]}';
+      final protocolName = protocol == 6 ? 'TCP' : protocol == 17 ? 'UDP' : protocol == 1 ? 'ICMP' : 'P=$protocol';
+
+      if (totalLength != data.length) {
+        FileLogger.log('🔴 [UP#$seq] 粘包! IPv4 $protocolName $srcIp→$dstIp 声明=$totalLength 实际=${data.length}');
+      } else {
+        FileLogger.logQuiet('✅ [UP#$seq] IPv4 $protocolName $srcIp→$dstIp len=$totalLength');
+      }
+    } else if (ipVersion == 6 && data.length >= 40) {
+      final payloadLength = (data[4] << 8) | data[5];
+      final totalLength = payloadLength + 40;
+      if (totalLength != data.length) {
+        FileLogger.log('🔴 [UP#$seq] 粘包! IPv6 声明=$totalLength 实际=${data.length}');
+      } else {
+        FileLogger.logQuiet('✅ [UP#$seq] IPv6 len=$totalLength');
+      }
+    } else {
+      FileLogger.log('⚠️ [UP#$seq] 未知IP版本=$ipVersion');
     }
   }
 

@@ -9,6 +9,7 @@ import '../ffi/slirp_wrapper.dart';
 import '../ffi/lib_loader.dart';
 import '../network/adb_manager.dart';
 import '../network/tunnel_server.dart';
+import '../utils/file_logger.dart';
 
 class RouterEngine {
   late final AdbManager _adbManager;
@@ -96,7 +97,7 @@ class RouterEngine {
   /// 互联网 -> 电脑端 -> 手机端
   /// 底层 libslirp 收到百度的回包，触发 Dart 回调，通过 TunnelServer 塞回给手机
   void _handleDataFromNetwork(Uint8List data) {
-    print('✅ [RouterEngine] libslirp 吐出了外网回包，准备发回手机！大小: ${data.length} Bytes');
+    FileLogger.logQuiet('✅ [RouterEngine] 回包→手机 ${data.length}B');
     _tunnelServer.sendToDevice(data);
   }
 
