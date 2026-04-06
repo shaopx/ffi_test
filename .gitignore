@@ -24,5 +24,8 @@ gnirehtet_server
 .DS_Store
 Thumbs.db
 
+# Runtime logs
+gnirehtet_*.txt
+
 # Claude Code
 .claude/

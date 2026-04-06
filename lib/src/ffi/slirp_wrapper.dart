@@ -6,6 +6,7 @@ import 'package:ffi/ffi.dart';
 
 import 'slirp_bindings.dart';
 import '../utils/file_logger.dart';
+import '../utils/connection_tracker.dart';
 import 'dart:async';
 
 typedef OnSendDataCallback = void Function(Uint8List data);
@@ -27,8 +28,75 @@ final class PollFd extends ffi.Struct {
 }
 
 typedef PollNative = ffi.Int32 Function(
-    ffi.Pointer<PollFd>, ffi.UnsignedLong, ffi.Int32);
+    ffi.Pointer<PollFd>, ffi.UnsignedInt, ffi.Int32);
 typedef PollDart = int Function(ffi.Pointer<PollFd>, int, int);
+
+// ========================================================================
+// 🔑 关键：libslirp SLIRP_POLL_* 和 POSIX POLL* 常量映射
+// libslirp 使用自己定义的事件位掩码，与 POSIX poll() 的不完全一致！
+// SLIRP_POLL_OUT=2 但 POLLOUT=4，SLIRP_POLL_PRI=4 但 POLLPRI=2
+// 必须在两个方向进行转换，否则 TCP connect() 完成信号完全丢失！
+// ========================================================================
+class _PollEventMapper {
+  // libslirp 常量 (来自 slirp.h)
+  static const int SLIRP_POLL_IN  = 1;  // 1 << 0
+  static const int SLIRP_POLL_OUT = 2;  // 1 << 1
+  static const int SLIRP_POLL_PRI = 4;  // 1 << 2
+  static const int SLIRP_POLL_ERR = 8;  // 1 << 3
+  static const int SLIRP_POLL_HUP = 16; // 1 << 4
+
+  // POSIX poll() 常量 (macOS/Linux)
+  static const int POLLIN   = 0x0001; // 1
+  static const int POLLPRI  = 0x0002; // 2
+  static const int POLLOUT  = 0x0004; // 4
+  static const int POLLERR  = 0x0008; // 8
+  static const int POLLHUP  = 0x0010; // 16
+  static const int POLLNVAL = 0x0020; // 32
+
+  /// 将 libslirp 的事件标志 → POSIX poll() 的 events
+  static int slirpToPoll(int slirpEvents) {
+    int pollEvents = 0;
+    if (slirpEvents & SLIRP_POLL_IN  != 0) pollEvents |= POLLIN;
+    if (slirpEvents & SLIRP_POLL_OUT != 0) pollEvents |= POLLOUT;
+    if (slirpEvents & SLIRP_POLL_PRI != 0) pollEvents |= POLLPRI;
+    if (slirpEvents & SLIRP_POLL_ERR != 0) pollEvents |= POLLERR;
+    if (slirpEvents & SLIRP_POLL_HUP != 0) pollEvents |= POLLHUP;
+    return pollEvents;
+  }
+
+  /// 将 POSIX poll() 的 revents → libslirp 的事件标志
+  static int pollToSlirp(int pollRevents) {
+    int slirpEvents = 0;
+    if (pollRevents & POLLIN   != 0) slirpEvents |= SLIRP_POLL_IN;
+    if (pollRevents & POLLOUT  != 0) slirpEvents |= SLIRP_POLL_OUT;
+    if (pollRevents & POLLPRI  != 0) slirpEvents |= SLIRP_POLL_PRI;
+    if (pollRevents & POLLERR  != 0) slirpEvents |= SLIRP_POLL_ERR;
+    if (pollRevents & POLLHUP  != 0) slirpEvents |= SLIRP_POLL_HUP;
+    if (pollRevents & POLLNVAL != 0) slirpEvents |= SLIRP_POLL_ERR; // NVAL 映射到 ERR
+    return slirpEvents;
+  }
+}
+
+// ========================================================================
+// 定时器系统：管理 libslirp 内部的 TCP 重传、超时等机制
+// ========================================================================
+class _SlirpTimer {
+  final int id;
+  final ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>> callback;
+  final ffi.Pointer<ffi.Void> cbOpaque;
+  int expireTimeNs = 0; // 到期时间（纳秒）
+  bool active = false;
+
+  _SlirpTimer({required this.id, required this.callback, required this.cbOpaque});
+
+  void fire() {
+    if (!active) return;
+    active = false;
+    // 调用 C 函数指针：触发 libslirp 内部的定时器回调
+    final dartCallback = callback.asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+    dartCallback(cbOpaque);
+  }
+}
 
 class SlirpWrapper {
   final SlirpBindings _bindings;
@@ -43,6 +111,10 @@ class SlirpWrapper {
 
   ffi.Pointer<SlirpCb> _savedCallbacks = ffi.nullptr;
   ffi.Pointer<SlirpConfig> _savedConfig = ffi.nullptr;
+
+  // 定时器注册表：timer 指针地址 → 定时器对象
+  static final Map<int, _SlirpTimer> _timers = {};
+  static int _timerIdCounter = 0;
 
   // libc poll() 函数指针
   static late final PollDart _nativePoll;
@@ -110,6 +182,13 @@ class SlirpWrapper {
   int _lastLoggedDriveCount = 0;
   DateTime _lastDriveLogTime = DateTime.now();
 
+  // poll() 诊断计数器
+  int _totalPollCalls = 0;
+  int _totalFdsWithEvents = 0;
+  int _totalPollOutEvents = 0; // POLLOUT: TCP connect完成信号
+  int _totalPollInEvents = 0;  // POLLIN: 有数据可读
+  int _totalPollErrEvents = 0; // POLLERR/POLLHUP/POLLNVAL
+
   void _driveEngine() {
     if (_slirpInstance == ffi.nullptr) return;
 
@@ -118,10 +197,25 @@ class SlirpWrapper {
     // 每 5 秒打印一次引擎心跳
     final now = DateTime.now();
     if (now.difference(_lastDriveLogTime).inSeconds >= 5) {
+      final activeTimers = _timers.values.where((t) => t.active).length;
       final rate = _driveCount - _lastLoggedDriveCount;
-      FileLogger.log('💓 [引擎心跳] 轮询#$_driveCount, 5秒内$rate次, socket=${_pollFds.length}');
+      FileLogger.key('💓 [引擎心跳] 轮询#$_driveCount, 5秒内$rate次, socket=${_pollFds.length}, 定时器=$activeTimers/${_timers.length}'
+          ' | poll统计: calls=$_totalPollCalls, fdsWithEvents=$_totalFdsWithEvents'
+          ', IN=$_totalPollInEvents, OUT=$_totalPollOutEvents, ERR=$_totalPollErrEvents');
       _lastLoggedDriveCount = _driveCount;
       _lastDriveLogTime = now;
+
+      // 触发连接追踪器的统计摘要输出
+      ConnectionTracker.printSummary();
+    }
+
+    // 【关键】触发过期的定时器 —— 这驱动 libslirp 的 TCP 状态机！
+    final nowNs = DateTime.now().microsecondsSinceEpoch * 1000;
+    final expiredTimers = _timers.values
+        .where((t) => t.active && t.expireTimeNs <= nowNs)
+        .toList();
+    for (final timer in expiredTimers) {
+      timer.fire();
     }
 
     final timeoutPtr = calloc<ffi.Uint32>();
@@ -149,22 +243,37 @@ class SlirpWrapper {
     );
 
     // 3. 【核心改进】用真正的 poll() 系统调用检测 socket 就绪状态
+    //    🔑 关键：必须在 slirp 事件 ↔ POSIX 事件之间做转换！
     final nfds = _pollFds.length;
     if (nfds > 0) {
       // 分配 C 结构体数组
       final pollFdsPtr = calloc<PollFd>(nfds);
       for (int i = 0; i < nfds; i++) {
         pollFdsPtr[i].fd = _pollFds[i];
-        pollFdsPtr[i].events = _pollRequestedEvents[i];
+        // ★ slirp 事件 → POSIX 事件（SLIRP_POLL_OUT=2 → POLLOUT=4）
+        pollFdsPtr[i].events = _PollEventMapper.slirpToPoll(_pollRequestedEvents[i]);
         pollFdsPtr[i].revents = 0;
       }
 
       // 调用 libc poll()，timeout=0 表示不阻塞，立即返回
       _nativePoll(pollFdsPtr, nfds, 0);
+      _totalPollCalls++;
 
-      // 读取真实的 revents
+      // 读取真实的 revents，并转换回 slirp 事件
       for (int i = 0; i < nfds; i++) {
-        _pollRevents[i] = pollFdsPtr[i].revents;
+        final rawRevents = pollFdsPtr[i].revents;
+        // ★ POSIX 事件 → slirp 事件（POLLOUT=4 → SLIRP_POLL_OUT=2）
+        _pollRevents[i] = _PollEventMapper.pollToSlirp(rawRevents);
+
+        // 诊断计数
+        if (rawRevents != 0) {
+          _totalFdsWithEvents++;
+          if (rawRevents & _PollEventMapper.POLLIN  != 0) _totalPollInEvents++;
+          if (rawRevents & _PollEventMapper.POLLOUT != 0) _totalPollOutEvents++;
+          if (rawRevents & (_PollEventMapper.POLLERR | _PollEventMapper.POLLHUP | _PollEventMapper.POLLNVAL) != 0) {
+            _totalPollErrEvents++;
+          }
+        }
       }
 
       calloc.free(pollFdsPtr);
@@ -310,6 +419,9 @@ class SlirpWrapper {
     }
     _wrapperRegistry.remove(_wrapperId);
 
+    // 清理所有定时器
+    _timers.clear();
+
     if (_savedCallbacks != ffi.nullptr) {
       calloc.free(_savedCallbacks);
       _savedCallbacks = ffi.nullptr;
@@ -407,16 +519,36 @@ class SlirpWrapper {
       ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>> cb,
       ffi.Pointer<ffi.Void> cbOpaque,
       ffi.Pointer<ffi.Void> opaque) {
-    return calloc<ffi.Uint64>(1).cast<ffi.Void>();
+    _timerIdCounter++;
+    // 分配一块合法内存作为定时器句柄（地址同时作为 Map key）
+    final handle = calloc<ffi.Uint64>(1).cast<ffi.Void>();
+    final timer = _SlirpTimer(
+      id: _timerIdCounter,
+      callback: cb,
+      cbOpaque: cbOpaque,
+    );
+    _timers[handle.address] = timer;
+    FileLogger.logQuiet('⏱️ [Timer] 创建定时器 #${timer.id} handle=${handle.address}');
+    return handle;
   }
 
   static void _cTimerFree(ffi.Pointer<ffi.Void> timer, ffi.Pointer<ffi.Void> opaque) {
     if (timer != ffi.nullptr) {
+      final t = _timers.remove(timer.address);
+      if (t != null) {
+        FileLogger.logQuiet('⏱️ [Timer] 释放定时器 #${t.id}');
+      }
       calloc.free(timer);
     }
   }
 
   static void _cTimerMod(ffi.Pointer<ffi.Void> timer, int expireTime, ffi.Pointer<ffi.Void> opaque) {
-    // TODO: 实现定时器调度
+    final t = _timers[timer.address];
+    if (t != null) {
+      t.expireTimeNs = expireTime;
+      t.active = true;
+      // 仅在非高频时刻记录（避免日志风暴）
+      FileLogger.logQuiet('⏱️ [Timer] 设置定时器 #${t.id} 到期时间=${expireTime}ns');
+    }
   }
 }

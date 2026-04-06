@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:async';
 import '../utils/file_logger.dart';
+import '../utils/connection_tracker.dart';
 
 /// 负责监听本地端口，接收来自 ADB Tunnel 的真实字节流
 class TunnelServer {
@@ -103,18 +104,33 @@ class TunnelServer {
     final seq = _downstreamPacketCount;
 
     try {
-      // 调试：分析回传包内容
+      // 下行连���追踪
       if (data.isNotEmpty) {
-        final ipVer = data[0] >> 4;
-        int declaredLen = data.length;
-        if (ipVer == 4 && data.length >= 20) {
-          declaredLen = (data[2] << 8) | data[3];
-        } else if (ipVer == 6 && data.length >= 40) {
-          declaredLen = ((data[4] << 8) | data[5]) + 40;
+        ConnectionTracker.trackDownstream(data);
+        // 前 50 个下行包：dump IP 头部，用于诊断 IP 匹配问题
+        if (seq <= 50 && data.length >= 20) {
+          final ver = data[0] >> 4;
+          if (ver == 4) {
+            final proto = data[9];
+            final srcIp = '${data[12]}.${data[13]}.${data[14]}.${data[15]}';
+            final dstIp = '${data[16]}.${data[17]}.${data[18]}.${data[19]}';
+            final ihl = (data[0] & 0x0F) * 4;
+            String portInfo = '';
+            if (data.length >= ihl + 4) {
+              final srcPort = (data[ihl] << 8) | data[ihl + 1];
+              final dstPort = (data[ihl + 2] << 8) | data[ihl + 3];
+              portInfo = ' ports=$srcPort→$dstPort';
+            }
+            String flagInfo = '';
+            if (proto == 6 && data.length >= ihl + 14) {
+              final flags = data[ihl + 13];
+              flagInfo = ' flags=0x${flags.toRadixString(16)}(${_describeFlags(flags)})';
+            }
+            FileLogger.key('🔬 [DOWN#$seq] ${data.length}B IPv$ver proto=$proto $srcIp���$dstIp$portInfo$flagInfo');
+          }
         }
-        final hexHead = data.take(4).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
-        FileLogger.log('🚀 [DOWN#$seq] 发回手机 ${data.length}字节, IPv$ipVer, IP头声明=$declaredLen, head=[$hexHead]');
       }
+      FileLogger.logQuiet('🚀 [DOWN#$seq] ${data.length}字节');
 
       _activeClient!.add(data);
     } catch (e) {
@@ -148,39 +164,45 @@ class TunnelServer {
     final seq = _upstreamPacketCount;
 
     if (data.isEmpty) {
-      FileLogger.log('⚠️ [UP#$seq] 收到空数据！');
+      FileLogger.key('⚠️ [UP#$seq] 收到空数据！');
       return;
     }
 
-    // Hex dump 前 20 字节
-    final hexPreview = data.take(20).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
-    FileLogger.log('📦 [UP#$seq] 收到 ${data.length} 字节, hex: $hexPreview');
-
-    final ipVersion = data[0] >> 4;
-    if (ipVersion == 4 && data.length >= 20) {
-      // IPv4: Total Length 在字节 2-3 (big-endian)
-      final totalLength = (data[2] << 8) | data[3];
-      final protocol = data[9]; // 6=TCP, 17=UDP, 1=ICMP
-      final srcIp = '${data[12]}.${data[13]}.${data[14]}.${data[15]}';
-      final dstIp = '${data[16]}.${data[17]}.${data[18]}.${data[19]}';
-      final protocolName = protocol == 6 ? 'TCP' : protocol == 17 ? 'UDP' : protocol == 1 ? 'ICMP' : 'P=$protocol';
-
-      if (totalLength != data.length) {
-        FileLogger.log('🔴 [UP#$seq] 粘包! IPv4 $protocolName $srcIp→$dstIp 声明=$totalLength 实际=${data.length}');
-      } else {
-        FileLogger.logQuiet('✅ [UP#$seq] IPv4 $protocolName $srcIp→$dstIp len=$totalLength');
+    // 检查粘包：计算实际包含几个 IP 包
+    int offset = 0;
+    int packetCount = 0;
+    while (offset < data.length) {
+      final ver = data[offset] >> 4;
+      int pktLen = data.length - offset;
+      if (ver == 4 && data.length - offset >= 20) {
+        pktLen = (data[offset + 2] << 8) | data[offset + 3];
+      } else if (ver == 6 && data.length - offset >= 40) {
+        pktLen = ((data[offset + 4] << 8) | data[offset + 5]) + 40;
       }
-    } else if (ipVersion == 6 && data.length >= 40) {
-      final payloadLength = (data[4] << 8) | data[5];
-      final totalLength = payloadLength + 40;
-      if (totalLength != data.length) {
-        FileLogger.log('🔴 [UP#$seq] 粘包! IPv6 声明=$totalLength 实际=${data.length}');
-      } else {
-        FileLogger.logQuiet('✅ [UP#$seq] IPv6 len=$totalLength');
-      }
-    } else {
-      FileLogger.log('⚠️ [UP#$seq] 未知IP版本=$ipVersion');
+      if (pktLen <= 0 || pktLen > data.length - offset) break;
+
+      // 将每个独立 IP 包送入连接追踪器
+      ConnectionTracker.trackUpstream(data, offset, pktLen);
+      packetCount++;
+      offset += pktLen;
     }
+
+    if (packetCount > 1) {
+      ConnectionTracker.recordStickyPacket(data.length, packetCount);
+    }
+
+    // 静默记录到全量日志
+    FileLogger.logQuiet('📦 [UP#$seq] ${data.length}字节 含${packetCount}个IP包');
+  }
+
+  static String _describeFlags(int flags) {
+    final parts = <String>[];
+    if (flags & 0x02 != 0) parts.add('SYN');
+    if (flags & 0x10 != 0) parts.add('ACK');
+    if (flags & 0x01 != 0) parts.add('FIN');
+    if (flags & 0x04 != 0) parts.add('RST');
+    if (flags & 0x08 != 0) parts.add('PSH');
+    return parts.isEmpty ? 'NONE' : parts.join('+');
   }
 
   /// 彻底关闭服务器 (用于退出 App 时)
